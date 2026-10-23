@@ -1,0 +1,36 @@
+# Local notes and agent instructions
+[Nn][Oo][Tt][Ee]*.[Mm][Dd]
+AGENTS.md
+CLAUDE.md
+
+# Local backups, reference manuals, and editor state
+/backups/
+/*.pdf
+.idea/
+.vscode/
+.vs/
+
+# Generated build directories and local CMake settings
+build/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+compile_commands.json
+.cache/
+
+# Firmware outputs and temporary files
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.obj
+*.d
+*.exe
+*.log
+*.tmp
+*.bak
+*~
+.DS_Store
+Thumbs.db
