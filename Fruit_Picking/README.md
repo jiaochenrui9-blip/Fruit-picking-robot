@@ -9,15 +9,20 @@
 - 遥控：ELRS 接收机 CRSF 输出接 USART1（4-pin 口，420000 8N1），DMA 循环接收 + 空闲中断。
 - 结构沿用 `C:\Project\Chassis_BareMetal`：调度在 `UserModules/Task/BareMetal.c`（2026-10-23 起只做调度；各机构拆到 `APP/Chassis/Chassis_Control`、`APP/Arm/Arm_Lift`、`Arm_Rotate`、`Arm_Node`，机构不读遥控，指令和"是否使能"由 BareMetal 当参数传进去）。`main.c` 只调 `BareMetal_Init()`、`BareMetal_MainLoop()`，HAL 回调只做转发：
   - USART1 空闲中断 / DMA 满一圈：`ELRS_DMA_UpdateSize` 只记 DMA 写到了哪；串口出错：`ELRS_DMA_HandleError` 只做标记。
-  - 主循环（`BareMetal_MainLoop`）：`ELRS_DMA_Process()` 解析 CRSF → `Chassis_Remote_Update()`（在线判断 + SA 使能 + 摇杆死区，固定低档）→ `Arm_Remote_Update(state)`（SB → 升降方向，SD → 旋转目标，SC → 伸缩方向，左摇杆上下 → 夹爪）→ 关中断，把 `chassis_command`、`arm_command` 一起整条拷贝（发布）→ `Arm_Node_Update()`：伸缩 / 夹爪指令变了就经 USART6 给机械臂 STM32 节点发命令帧（见下面"USART6：机械臂 STM32 节点"）。
+  - 主循环（`BareMetal_MainLoop`）：`ELRS_DMA_Process()` 解析 CRSF → `Chassis_Remote_Update()`（在线判断 + SA 使能 + 摇杆死区，固定中档）→ `Arm_Remote_Update(state)`（2026-10-24 起：SB → 升降方向，SC → 旋转方向，左摇杆上下 → 步进方向，SD → 夹爪，SA（整车状态）→ 果篮）→ 关中断，把 `chassis_command`、`arm_command` 一起整条拷贝（发布）→ `Arm_Node_Update()`：步进 / 夹爪 / 剪线 / 果篮指令变了就经 USART6 给机械臂 STM32 节点发命令帧（见下面"USART6：机械臂 STM32 节点"）。
   - TIM8 1 kHz（`BareMetal_ControlTick`）：先判一次遥控在线（`ELRS_CRSF_IsOnline()`）且 `chassis_command.state == ENABLED`（`BareMetal_IsEnabled`），结果当参数传给三个机构，按顺序调：`Chassis_Control_Update`（全向轮解算 `Omni_Remote_Update` → 速度环 → CAN1 一帧 `0x200`）、`Arm_Lift_Update`（升降速度环 → CAN2 `0x200`，见下面"CAN2：升降 3508"）、`Arm_Rotate_Update`（RS05，见下面"CAN2：旋转 RS05"）；不使能时都失能。
   - 中断只读发布出来的 `chassis_command` / `arm_command`，不碰遥控模块自己那份（`Chassis_Remote` 那份是逐字段写的）。在线在中断里直接判，主循环卡住、发布的指令停在最后一次时照样能停。
 - 状态：
   - 上电后还没收到帧，或超过 `ELRS_CRSF_ONLINE_TIMEOUT_MS`（现在 500 ms）没收到有效通道帧 → OFFLINE；CH5 不在使能位 → LOCKED。这两种情况四个电机都失能（电流 0）。
   - CH5 拨到使能位 → ENABLED，电机切到速度模式。只在模式变化时调 `MotorControl_SetMode`（它会清 PID 和目标）。
-  - 没做"重新上线要先拨锁定再拨使能"：摇杆会回中，开关在使能位时上线底盘也不会自己跑。不回中的拨杆（升降的 SB、伸缩的 SC）单独做了"回过中位才生效"，SD 和左摇杆上下做了"使能后变一次才动"，见下面各节。
-- 通道（遥控器 BETAFPV，SA / SD 两档，SB / SC 三档，拨上读数为负）：CH2 = wz，CH3 = vy，CH4 = vx，CH5 = SA 使能（拨上为使能），CH6 = SB 升降（拨上 / 中 / 下 = 往上 / 停 / 往下），CH7 = SC 伸缩（拨上 / 中 / 下 = 节点步进正转 / 停 / 反转），CH8 = SD 旋转（拨上正前方 / 拨下果框上方），CH1 = 左摇杆上下 → 夹爪（推上打开 / 拉下闭合；CH1 是代码里唯一没用的摇杆通道，是不是左摇杆上下要上板核对）。
-- 底盘速度固定低档（`speed_limit` = 0.35）：SB 改给升降以后（2026-10-22），没有档位开关了。
+  - 没做"重新上线要先拨锁定再拨使能"：摇杆会回中，开关在使能位时上线底盘也不会自己跑。不回中的拨杆 / 摇杆单独做了保护：升降的 SB、步进的左摇杆上下"回过中位才生效"，旋转的 SC"这次 RS05 使能后回过中位才动"，夹爪的 SD"使能后拨一次才动"，见下面各节。
+- 通道（遥控器 BETAFPV，SA / SD 两档，SB / SC 三档，拨上读数为负）：CH2 = wz，CH3 = vy，CH4 = vx，CH5 = SA 使能 + 果篮（拨上使能 + 关果篮 / 拨下锁定 + 开果篮，掉线时果篮不动），CH6 = SB 升降（拨上 / 中 / 下 = 往上 / 停 / 往下），CH7 = SC 旋转 RS05（拨上 / 中 / 下 = 往正前方 / 停 / 往果框上方，左右反了改 `ARM_ROTATE_SC_UP_DIR`），CH8 = SD 夹爪（拨上合，合到位后剪线一直往复 / 拨下开，剪线先回张开位），CH1 = 左摇杆上下 → 步进（推上前进 / 中间停 / 拉下后退；10-23 读板确认 CH1 是不回中的左摇杆上下，拉下为负）。这套映射是 2026-10-24 按机械那边的要求改的。
+- 底盘速度固定中档（`speed_limit` = 0.65，2026-10-25 起；之前是低档 0.35）：SB 改给升降以后（2026-10-22），没有档位开关了。
+- 上坡（2026-10-25，用户实测坡上不去）：
+  - 电流指令限幅 `CHASSIS_CURRENT_LIMIT` 3000 → 8000（协议数值，±16384 ↔ ±20 A；8000 ≈ 9.8 A，接近 M3508 手册的额定电流 10 A / 额定（最大连续）转矩 3 N·m；原来 3000 ≈ 3.7 A，约 1.1 N·m）。C620 最大持续电流 20 A。
+  - 速度环积分项上限：驱动默认 `SPEED_PID_I_OUTPUT_LIMIT` = 1000（≈ 1.2 A，升降还在用，没动），底盘用新加的 `MotorControl_SetSpeedIntegralLimit` 单独放到 `CHASSIS_SPEED_I_LIMIT` = 6000（≈ 7.3 A）。坡上要一直出力，原来积分最多补 1.2 A，剩下全靠比例项，转速会被拖下来。
+  - 指令加速度限制 `CHASSIS_COMMAND_RAMP_PER_S` = 1.0（`Chassis_Control.c`，本次发布参数）：TIM8 里 vx / vy / wz 每拍最多变 0.001，三个量按同一比例缩，方向不变；0 → 中档推满约 0.65 s。限幅放大以后不加这个，平地起步 / 刹车的电流会是原来的两倍左右；嫌肉就把这个数改大。锁车 / 掉线照旧马上失能（不出力，坡上会溜）。
+  - 还是上不去的话：先看坡上 `chassis_motors[i].output_current` 是不是顶到 ±8000（顶到了 = 电流不够，可以再往上放，M3508 堵转扭矩 4.5 N·m ≈ 15 A ≈ 12288，长时间不要超过额定）；没顶到但轮子在空转 = 打滑，软件帮不了。
 - 解算参数（`UserModules/APP/Chassis/Omni_Remote.c`）还是旧底盘的实测值：轮心到中心 0.20 m、轮半径 0.076 m、平移最大 1 m/s、旋转最大 3 rad/s、转子转速上限 8000 rpm，要按新底盘改。
 - 速度环 PID 在 `Chassis_Control.c` 的 `chassis_speed_pid` 表里，沿用试调值：ID1/3/4 Kp=5、ID2 Kp=8，Ki 都是 20，Kd=0；电流指令限幅 `CHASSIS_CURRENT_LIMIT` ±3000（协议数值，非安培）。
 - 沿用驱动的反馈超时保护：未收到反馈或反馈超过 100 ms 未更新，输出电流清零。
@@ -26,18 +31,18 @@
 
 1. 车架空。上电后先不开遥控器：`chassis_command.state` 应为 OFFLINE（0），四个电机的 `mode` 为 `MOTOR_MODE_DISABLE`。
 2. 打开遥控器，暂停看：`crsf_valid_frame_count` 在涨（每秒涨的数接近包率），`crsf_crc_error_count` 基本不动，`elrs_channels[]` 摇杆 172~1811、中位 992；挨个拨开关核对通道。这几个都是 `elrs_crsf.c` 里的 static 变量，Watches 里看不到就写 `'elrs_crsf.c'::elrs_channels`。
-3. SB 放中位，把 SA（CH5）拨到使能：state 变 ENABLED，电机切到速度模式。右摇杆推满向前时，`chassis_motors[0..3].speed.target_rpm` 按 ID1~4 应为右前 −、右后 −、左后 +、左前 +（固定低档，约 ±590 转子 rpm，拨 SB 不影响）；右移应为 `+ − − +`，顺时针应为 `+ + + +`。先核对电调编号和每轮实际驱动方向，再验证通道方向。
+3. SB 放中位，把 SA（CH5）拨到使能：state 变 ENABLED，电机切到速度模式。右摇杆推满向前时，`chassis_motors[0..3].speed.target_rpm` 按 ID1~4 应为右前 −、右后 −、左后 +、左前 +（固定中档，约 0.33 s 内涨到约 ±1097 转子 rpm，拨 SB 不影响）；右移应为 `+ − − +`，顺时针应为 `+ + + +`。先核对电调编号和每轮实际驱动方向，再验证通道方向。
 4. 关掉遥控器：超过 500 ms 后电机失能，state 变 OFFLINE。
 5. 暂停时单片机不发 CAN 帧，C620 收不到指令时会怎样手册没写：测试时车要架空，暂停尽量短。
 
 ### 调试变量地址（VOFA）
 
-按 2026-10-22 BareMetal 版 Debug 构建出的 ELF。全局变量从 `main.c` 挪进了 `BareMetal.c`，地址和之前不一样了；后续重新编译仍应以当次 ELF 为准。2026-10-22 加了 CAN2 升降、加了 `Arm_Remote` 以后都重新核对过，下面这几个地址没变；2026-10-23 加机械臂节点以后也核对过，没变。2026-10-23 把 `BareMetal.c` 按机构拆开以后又核对过：四台电机的地址没变（`Chassis_Control.c` 在 CMakeLists 里排在原来 `BareMetal.c` 的位置），只有 `chassis_command` 挪了。升降的地址见下一节。
+按 2026-10-22 BareMetal 版 Debug 构建出的 ELF。全局变量从 `main.c` 挪进了 `BareMetal.c`，地址和之前不一样了；后续重新编译仍应以当次 ELF 为准。2026-10-22 加了 CAN2 升降、加了 `Arm_Remote` 以后都重新核对过，下面这几个地址没变；2026-10-23 加机械臂节点以后也核对过，没变。2026-10-23 把 `BareMetal.c` 按机构拆开以后又核对过：四台电机的地址没变（`Chassis_Control.c` 在 CMakeLists 里排在原来 `BareMetal.c` 的位置），只有 `chassis_command` 挪了。2026-10-24 遥控映射改版以后再核对：四台电机没变，`chassis_command` 往后挪了 12 字节（`Arm_Node.c` 多了几个变量）。2026-10-25 底盘加了加速度限制（`Chassis_Control.c` 多了一个 20 字节的变量）：四台电机还是没变，**它们以外的地址（本节的 `chassis_command`，以及升降、RS05、节点三节）都往后挪了 20 字节（0x14）**，下面已按新 ELF 用 gdb 重算。升降的地址见下一节。
 
 - 四台 `speed_rpm`（`int16_t`，实际转子转速）：`0x2000042E`、`0x200004EE`、`0x200005AE`、`0x2000066E`
 - 四台 `speed.target_rpm`（`float`，目标转子转速）：`0x2000043C`、`0x200004FC`、`0x200005BC`、`0x2000067C`
 - 速度环 Kp（`float`）：`0x20000440`、`0x20000500`、`0x200005C0`、`0x20000680`，Ki / Kd 各顺延 4 / 8 字节
-- `chassis_command`：`0x20000954` 起（2026-10-23 拆分以后；之前是 0x20000718），`state` 在 +0（1 字节），vx / vy / wz（`float`）在 +8 / +12 / +16
+- `chassis_command`：`0x20000974` 起（2026-10-24 改版以后；10-23 拆分后是 0x20000954，更早是 0x20000718），`state` 在 +0（1 字节），vx / vy / wz（`float`）在 +8 / +12 / +16
 
 ## CAN2：升降 3508（SB 拨杆控制，速度模式）
 
@@ -48,9 +53,9 @@
   - 回过中位才生效：掉线或锁定时清掉 `LiftArmed`；重新使能（上电、遥控重连、重新拨 SA）以后，SB 要先在中位出现一次，之后才按档位走。没回中之前 `lift_dir` 一直是 0，升降原地停住。
   - 算完和底盘指令在同一次关中断里发布到 `arm_command`。
 - 控制（TIM8，`Arm_Lift_Update`，在 `APP/Arm/Arm_Lift.c`）：遥控在线 + SA 使能 → 速度模式，目标 = `arm_command.lift_dir × LIFT_SPEED_RPM`；否则失能（机构失能后自己能停住）。和底盘一样只在模式变化时调 `MotorControl_SetMode`。
-- 参数（`Arm_Lift.c`，2026-10-22 上板试调）：`LIFT_SPEED_RPM` = 1000（转子 rpm，输出轴约 52 rpm）；Kp = 10、Ki = 30、Kd = 0；电流指令限幅 `LIFT_CURRENT_LIMIT` ±5000（约 6.1 A）；`motor_direction` = −1（实测 + = 往上）。
+- 参数（`Arm_Lift.c`）：`LIFT_SPEED_RPM` = 1000（转子 rpm，输出轴约 52 rpm）；Kp = 15、Ki = 30、Kd = 0（2026-10-22 上板试调）；电流指令限幅 `LIFT_CURRENT_LIMIT` ±8000（约 9.8 A，接近 M3508 额定电流 10 A；2026-10-25 用户要求从 6000（约 7.3 A）调大）；`motor_direction` = −1（实测 + = 往上）。速度环积分项上限还是驱动默认的 1000（约 1.2 A），带重物往上时转速掉得多的话可以像底盘一样单独放大。
 - 要注意：
-  - **还没有软限位**：拨着 SB 冲到头会顶住，速度环 Kp × 1000 = 10000 超过限幅，输出顶满 5000（约 6.1 A）。行程测完再加。
+  - **还没有软限位**：拨着 SB 冲到头会顶住，速度环 Kp × 1000 = 15000 超过限幅，输出顶满 8000（约 9.8 A，2026-10-25 起；之前 6000）。到头别一直拨着，行程测完再加软限位。
   - ELRS 串口出错重启时，驱动会把它当成掉线（通道、时间戳清零）：底盘会停一下，升降还要 SB 重新回中才能再动。上板时偶尔遇到"升降突然不动、回中再拨就好"，可结合串口错误计数核对。
   - 往上走时如果稳态转速明显低于目标，可能是速度环积分上限 `SPEED_PID_I_OUTPUT_LIMIT` = 1000（约 1.2 A，`motor_control.c`）扛不住重力；这个宏底盘也在用。
   - CAN2 启动失败（比如总线一直是显性电平）时 `BareMetal_Init` 返回错误、进 `Error_Handler`，底盘也跟着不动。
@@ -67,27 +72,27 @@
 
 ### 调试变量地址（升降）
 
-2026-10-23 把 `BareMetal.c` 按机构拆开以后，这一组地址整体变了，下面是按新 ELF 用 gdb 算的；以后重新编译仍以当次 ELF 为准。
+2026-10-23 把 `BareMetal.c` 按机构拆开以后，这一组地址整体变了，下面是按新 ELF 用 gdb 算的；以后重新编译仍以当次 ELF 为准。2026-10-24 遥控映射改版以后又算过：电机这几个没变，只有 `arm_command.lift_dir`、`LiftArmed` 挪了。2026-10-25 以后这一节全部往后挪了 20 字节（见上一节），下面是新值。
 
 速度、电流、编码器都已经乘过 `motor_direction`（−1），+ = 往上；实际发给 C620 的电流是 `output_current` 取反。
 
-- `lift_motor.speed_rpm`（`int16_t`，实际转子转速）：`0x2000075A`
-- `lift_motor.speed.target_rpm`（`float`，目标转子转速）：`0x20000768`
-- 速度环 Kp / Ki / Kd（`float`）：`0x2000076C` / `0x20000770` / `0x20000774`
-- `lift_motor.output_current`（`int16_t`，速度环输出的电流指令）：`0x200007F6`
-- `lift_motor.feedback_current`（`int16_t`，C620 反馈的实际电流）：`0x2000075C`
-- `lift_motor.total_encoder`（`int32_t`，收到第一帧反馈时清 0，转子每圈 8192）：`0x20000764`
-- `lift_motor.mode`（1 字节，0 失能 / 2 速度）：`0x20000745`
-- `arm_can_tx_status`（1 字节）：`0x20000804`
-- `arm_command.lift_dir`（`int8_t`，发布出去的升降方向）：`0x20000968`
-- `LiftArmed`（`Arm_Remote.c` 里的 static，1 = SB 已经回过中位）：`0x2000096E`（2026-10-23 拆分以后），Watches 里写 `'Arm_Remote.c'::LiftArmed`
+- `lift_motor.speed_rpm`（`int16_t`，实际转子转速）：`0x2000076E`
+- `lift_motor.speed.target_rpm`（`float`，目标转子转速）：`0x2000077C`
+- 速度环 Kp / Ki / Kd（`float`）：`0x20000780` / `0x20000784` / `0x20000788`
+- `lift_motor.output_current`（`int16_t`，速度环输出的电流指令）：`0x2000080A`
+- `lift_motor.feedback_current`（`int16_t`，C620 反馈的实际电流）：`0x20000770`
+- `lift_motor.total_encoder`（`int32_t`，收到第一帧反馈时清 0，转子每圈 8192）：`0x20000778`
+- `lift_motor.mode`（1 字节，0 失能 / 2 速度）：`0x20000759`
+- `arm_can_tx_status`（1 字节）：`0x20000818`
+- `arm_command.lift_dir`（`int8_t`，发布出去的升降方向）：`0x20000988`（2026-10-24 改版以后；之前 0x20000968）
+- `LiftArmed`（`Arm_Remote.c` 里的 static，1 = SB 已经回过中位）：`0x2000098E`（2026-10-24 改版以后；之前 0x2000096E），Watches 里写 `'Arm_Remote.c'::LiftArmed`
 
-## CAN2：旋转 RS05（SD 控制：拨上到正前方，拨下到果框上方，CSP 位置模式）
+## CAN2：旋转 RS05（SC 点动：拨上往正前方、拨下往果框上方、中位停，CSP 位置模式）
 
 - RS05 走私有协议（扩展帧，1 Mbps），电机 ID 1，主机 ID 0xFD；CAN2 用过滤器组 15（扩展帧全收，是哪台电机由驱动按 ID 判断）。
 - 初始化（`Arm_Rotate_Init`，在 `APP/Arm/Arm_Rotate.c`）：`RS05_Manager_Init` → 填 `motor_id` = 1 再注册 → `RS05_Manager_Start`（配过滤器；CAN2 已被升降启动过，只再开一次接收中断）→ 发一次停止（类型 4），保证处在失能（复位）状态。没回不算初始化失败，底盘和升降照常。和 C 板一起上电时 RS05 启动得慢（2026-10-22 实测：开机后约 1.4 s 内的读请求都没回复），这帧停止多半没回复，`rotate_motor.last_feedback_tick` 会是 0，不代表 RS05 不在线；判断在线看 `rotate_mech_pos_count` 在不在涨。
 - `main.c` 的 CAN 接收回调：CAN2 的同一帧交给大疆和 RS05 两个驱动，大疆只认标准帧，RS05 只认扩展帧。
-- 遥控（主循环，`Arm_Remote.c`）：使能时 SD（CH8）拨下 → `arm_command.rotate_basket` = 1（果框上方），其余 0（正前方）；锁定 / 掉线时为 0。
+- 遥控（主循环，`Arm_Remote.c`，2026-10-24 起）：使能时 SC（CH7）拨上 → `arm_command.rotate_dir` = −1（往正前方），中位 → 0（停），拨下 → +1（往果框上方）；拨上对应哪边由 `ARM_ROTATE_SC_UP_DIR` 定，左右反了改它。锁定 / 掉线时为 0。
 - TIM8（`Arm_Rotate_Update`）每拍最多发一帧 RS05 的帧，按顺序看：
   1. `Arm_Rotate_TrackOnline`：跟踪 RS05 在不在线（300 ms 内回过 mechPos）。掉线 1 s 以上又回来，当成 RS05 重新上过电，`rotate_zero_sta_state` 清 0、重新读。这一步必须在控制之前，不然 RS05 一回来，控制会拿着上一次上电的 zero_sta 结论去使能（主机模拟里抓到过）。
   2. 控制（`Arm_Rotate_Control`），见下面。
@@ -98,11 +103,13 @@
   - 能使能的条件（`rotate_block` 显示第一个不满足的）：遥控在线 + SA 使能（1）、RS05 在线（2）、这次 RS05 上电时 zero_sta 已经是 1（3）、位置在 [正前方 − 0.2, 果框上方 + 0.2] rad 里（4）。
   - 使能流程（照旧驱动 `RS05_EnterCSPMode` 的顺序，一拍一帧，发不出去下一拍原地重发，不跳步）：停止 → run_mode = 5 → 限流 2.4 A → 限速 1.0 rad/s → 目标 → 使能 → 限流 → 限速 → 目标。使能后把限流、限速、目标再写一遍，防使能前写的没被收下（手册写法是使能后再写；电机默认限流可能很大）。
   - 运行中（`rotate_state` = 2）每 20 ms 重发一次目标。
-  - 目标：使能那一刻先停在原地（当时的位置），SD 拨一下（和使能那一刻不一样了）以后才按 SD 走：拨上正前方 `ROTATE_FRONT_RAD` = −2.460，拨下果框上方 `ROTATE_BASKET_RAD` = 2.426（都是 zero_sta = 1 下的读数）。所以上电、遥控重连、重新拨 SA 使能、RS05 重启以后，机械臂都不会自己转。
+  - 目标（点动，2026-10-24 起）：`rotate_dir` = −1 → 目标直接给正前方 `ROTATE_FRONT_RAD` = −2.460，+1 → 给果框上方 `ROTATE_BASKET_RAD` = 2.426（都是 zero_sta = 1 下的读数），速度由 CSP 限速管；0 → 目标 = 回中那一刻的位置（只在回中那一下记一次，之后一直停在那里，不跟着读数走，否则抱不住）。两端就是软限位：目标永远在 [−2.460, 2.426] 里，这段经过 0、不经过 ±π；跳变点 ±π 在没用到的约 75° 里（离两端 0.68 / 0.72 rad），电机自己转不过去。
+  - 回中时取哪个位置：优先用类型 2 应答里的位置 `rotate_motor.position_rad`（运行中每 20 ms 写一次目标都有应答，最多旧约 20 ms）；它超过 50 ms 没更新、或者和 mechPos 差 0.3 rad 以上（万一两种读数对不上），就退回用 mechPos（每 100 ms 读一次，按 1 rad/s 停下时会往回退最多约 0.1 rad）。两种读数一不一样要上板确认（见下面"上板测试"）。
+  - 使能那一刻先停在原地（当时的位置），这次使能后 SC 回过一次中位才按 SC 走。这条放在 `Arm_Rotate` 里、不放 `Arm_Remote`：RS05 可能比遥控晚使能（等 zero_sta、位置检查），也可能自己重启后重新使能，要按它真正使能的那一刻算。所以上电、遥控重连、重新拨 SA 使能、RS05 重启以后，SC 正好拨在一边，机械臂也不会自己转。
   - 条件不满足了（SA 锁定、遥控掉线、RS05 掉线、位置不对）→ 发停止 → 失能（复位模式），机械臂可以手推。
   - 余量为什么只给 0.2 rad：没用到的那段（约 1.4 rad）上电读数会折到另一头，余量越大越分不清"果框再往外"和"正前方再往里"；0.2 时要推出果框 1.2 rad（RS05 输出）以上才会被误认成正前方。
-- 参数（`Arm_Rotate.c` 开头）：`ROTATE_SPEED_LIMIT_RAD_S` 1.0（RS05 输出轴，走完全程约 5 s，先慢）、`ROTATE_CURRENT_LIMIT_A` 2.4（RS05 额定相电流）、`ROTATE_TARGET_PERIOD_MS` 20。正前方、果框上方是手推量的，差几度就推到准确位置读一下 `rotate_mech_pos_rad` 改这两个宏。
-- 还没做：和升降的联锁（转之前先把升降、伸缩收好，先靠操作习惯）；RS05 的 CAN 超时（canTimeout = 0，C 板死机时 RS05 会停在最后的目标上，不会自己乱动）。
+- 参数（`Arm_Rotate.c` 开头）：`ROTATE_SPEED_LIMIT_RAD_S` 1.0（RS05 输出轴，走完全程约 5 s，先慢）、`ROTATE_CURRENT_LIMIT_A` 2.4（RS05 额定相电流）、`ROTATE_TARGET_PERIOD_MS` 20、`ROTATE_FEEDBACK_FRESH_MS` 50 / `ROTATE_FEEDBACK_MATCH_RAD` 0.3（回中取位置用）。正前方、果框上方是手推量的（现在也是点动的两端），差几度就推到准确位置读一下 `rotate_mech_pos_rad` 改这两个宏。
+- 还没做：和升降的联锁（转之前先把升降、伸缩收好，先靠操作习惯）；RS05 的 CAN 超时（canTimeout = 0：C 板死机时 RS05 按最后的目标走，点动时最后的目标可能是行程一端，会走到那一端停下，不会出行程）。
 
 ### zero_sta：上电后自动检查，不是 1 就写 1（2026-10-22 用户决定）
 
@@ -119,13 +126,13 @@
   - 写完以后只重刷 C 板、RS05 没断电时，`rotate_zero_sta_state` 会显示 1，但 RS05 这次上电用的还是旧范围。所以第一次写完一定要把 RS05 断电重启一次；以后做使能时，除了 state = 1，还要检查位置在行程范围内才放行。
   - `rotate_zero_sta_write_count` 每次重启都涨 → 说明没存进 flash，告诉我。
 
-### 上板测试（SD 控制旋转）
+### 上板测试（SC 点动旋转）
 
 1. 先把机械臂摆在正前方，旋转范围里别放东西，手放在电池开关上。烧录这一版。
 2. 第一次上电：zero_sta 还是出厂的 0 → 程序自动写 1 并保存，`rotate_zero_sta_state` = 2，`rotate_block` = 3，RS05 不会使能。把电池那一路断电再上电 → `rotate_zero_sta_state` 变 1。
-3. SA 拨使能：`rotate_block` = 0，`rotate_state` 变 2（运行中），机械臂停在原地不动，`rotate_target_rad` ≈ 当前位置（约 −2.46）。
-4. SD 拨下：`rotate_target_rad` 变 2.426，机械臂往果框上方转，约 5 s 到；SD 拨上：回正前方。方向不对（比如拨下往反方向转）马上拨 SA 锁定。
-5. SA 拨锁定：`rotate_state` 变 0，RS05 失能，可以手推。再拨使能：停在原地，拨一下 SD 才动。
+3. SC 放中位，SA 拨使能：`rotate_block` = 0，`rotate_state` 变 2（运行中），机械臂停在原地不动，`rotate_target_rad` ≈ 当前位置（约 −2.46）。
+4. SC 拨下：`arm_command.rotate_dir` = 1、`rotate_target_rad` 变 2.426，机械臂往果框上方转（走完全程约 5 s）；中途回中：`rotate_target_rad` 变成当时的位置，机械臂停住、不往回退；拨上：往正前方走。拨着不放会正好停在两端。左右反了（比如拨上往果框转）马上拨 SA 锁定，然后把 `Arm_Remote.h` 的 `ARM_ROTATE_SC_UP_DIR` 改成 1。回中停住后对比 `rotate_motor.position_rad` 和 `rotate_mech_pos_rad`：两个应该差不多（0.1 rad 以内）；差得多告诉我（程序会自动退回用 mechPos，但最好弄清楚）。
+5. SA 拨锁定：`rotate_state` 变 0，RS05 失能，可以手推。SC 拨在一边时再拨使能：停在原地，SC 回一次中位才动。
 6. 不动的话看 `rotate_block`：1 遥控没使能 / 2 RS05 不在线 / 3 zero_sta 还不是 1（断电重启 RS05）/ 4 位置不在行程里（推回正前方和果框之间）。
 
 ### 上板测量（找位置区间）
@@ -142,71 +149,83 @@
 
 ### 调试变量地址（RS05）
 
-按 2026-10-23 拆分以后的 Debug 构建（这一组地址整体变了）；Watches 里直接写变量名也行。
+按 2026-10-23 拆分以后的 Debug 构建（这一组地址整体变了；2026-10-24 改版以后核对过，除了 `arm_command.rotate_dir` 都没变；2026-10-25 以后全部往后挪了 20 字节，下面是新值）；Watches 里直接写变量名也行。
 
-- `rotate_mech_pos_rad`（`float`，最近一次读到的 mechPos，rad）：`0x200008F8`
-- `rotate_mech_pos_count`（`uint32_t`，一共读到了几次）：`0x200008FC`
-- `rotate_can_tx_status`（1 字节，最近一次读请求的发送结果）：`0x20000900`
-- `rotate_motor.position_rad`（`float`，类型 2 反馈里的位置，±4π 循环；现在只有初始化时停止帧的回复会更新它，和 C 板一起上电时通常收不到，一直是 0）：`0x20000840`
-- `rotate_motor.state` / `fault_flags`（各 1 字节，类型 2 里的模式状态 0 复位 / 1 标定 / 2 运行，故障位）：`0x20000850` / `0x20000851`
-- `rotate_motor.last_feedback_tick`（`uint32_t`，最近一次收到类型 2 的时刻）：`0x20000854`
-- `rotate_zero_sta`（1 字节，最近一次读到的 zero_sta）：`0x20000901`
-- `rotate_zero_sta_state`（1 字节，0 还没读到 / 1 这次上电已经是 1 / 2 不是 1、已自动写好、要重启 RS05）：`0x20000902`
-- `rotate_zero_sta_write_count`（`uint32_t`，一共自动写了几次）：`0x20000904`
-- `rotate_state`（1 字节，0 失能 / 1 正在使能 / 2 运行中 / 3 正在停）：`0x20000908`
-- `rotate_block`（1 字节，0 可以使能 / 1 遥控没使能 / 2 RS05 不在线 / 3 zero_sta 还不是 1 / 4 位置不在行程里）：`0x20000909`
-- `rotate_target_rad`（`float`，现在发给 RS05 的目标）：`0x2000090C`
-- `arm_command.rotate_basket`（1 字节，发布出去的 SD：0 正前方 / 1 果框上方）：`0x20000969`
+- `rotate_mech_pos_rad`（`float`，最近一次读到的 mechPos，rad）：`0x2000090C`
+- `rotate_mech_pos_count`（`uint32_t`，一共读到了几次）：`0x20000910`
+- `rotate_can_tx_status`（1 字节，最近一次读请求的发送结果）：`0x20000914`
+- `rotate_motor.position_rad`（`float`，类型 2 应答里的位置，±4π 循环；运行中每 20 ms 写目标都有应答会更新它，SC 回中时用它当停住的位置；失能时只有停止帧的回复会更新）：`0x20000854`
+- `rotate_motor.state` / `fault_flags`（各 1 字节，类型 2 里的模式状态 0 复位 / 1 标定 / 2 运行，故障位）：`0x20000864` / `0x20000865`
+- `rotate_motor.last_feedback_tick`（`uint32_t`，最近一次收到类型 2 的时刻）：`0x20000868`
+- `rotate_zero_sta`（1 字节，最近一次读到的 zero_sta）：`0x20000915`
+- `rotate_zero_sta_state`（1 字节，0 还没读到 / 1 这次上电已经是 1 / 2 不是 1、已自动写好、要重启 RS05）：`0x20000916`
+- `rotate_zero_sta_write_count`（`uint32_t`，一共自动写了几次）：`0x20000918`
+- `rotate_state`（1 字节，0 失能 / 1 正在使能 / 2 运行中 / 3 正在停）：`0x2000091C`
+- `rotate_block`（1 字节，0 可以使能 / 1 遥控没使能 / 2 RS05 不在线 / 3 zero_sta 还不是 1 / 4 位置不在行程里）：`0x2000091D`
+- `rotate_target_rad`（`float`，现在发给 RS05 的目标）：`0x20000920`
+- `arm_command.rotate_dir`（`int8_t`，发布出去的 SC：−1 往正前方 / 0 停 / +1 往果框上方）：`0x20000989`（2026-10-24 改版以后；之前是 `rotate_basket` 0x20000969）
 
-## USART6：机械臂 STM32 节点（SC 控伸缩步进，左摇杆上下控夹爪）
+## USART6：机械臂 STM32 节点（左摇杆上下控步进，SD 控夹爪 + 剪线，SA 带果篮）
 
-- 节点固件是 `C:\Clion\SC09ServoTest`（STM32F103C8T6）：USART2 收 C 板的命令，USART3 经 RS-485 控 PD42S1（伸缩步进），USART1 控 SC09 舵机（夹爪）。C 板按它的协议发，五条命令都不带数据（`UserModules/Devices/ArmNode/ArmNode_Command.h`，和节点 `node_app.h` 的 `Node_Command` 一一对应）：
+- 节点固件是 `C:\Clion\SC09ServoTest`（STM32F103C8T6）：USART2 收 C 板的命令，USART3 经 RS-485 控 PD42S1（伸缩步进），USART1 控 SC09 舵机（夹爪），TIM1_CH1（PA8）出 PWM 给 LD-2015 剪线舵机，TIM1_CH4（PA11）出 PWM 给果篮舵机（2026-10-24 加的）。C 板按它的协议发，九条命令都不带数据（`UserModules/Devices/ArmNode/ArmNode_Command.h`，和节点 `node_app.h` 的 `Node_Command` 一一对应）：
 
   | 命令 | 动作 | 完整帧 |
   |---|---|---|
   | 0x01 | 夹爪打开（舵机 270） | `AA 55 01 01 00 00 50 18` |
-  | 0x02 | 夹爪闭合（舵机 360） | `AA 55 01 02 00 00 A0 18` |
+  | 0x02 | 夹爪闭合（舵机 380，2026-10-25 起；之前 360） | `AA 55 01 02 00 00 A0 18` |
   | 0x03 | 步进正转 20 rpm | `AA 55 01 03 00 00 F1 D8` |
   | 0x04 | 步进停止（节点里 0xFC 刹车 + 0xFB 清状态） | `AA 55 01 04 00 00 40 19` |
   | 0x05 | 步进反转 20 rpm | `AA 55 01 05 00 00 11 D9` |
+  | 0x06 | 剪线开始（LD-2015 在 500 / 2500 µs 之间一直往复，每端停 2 s） | `AA 55 01 06 00 00 E1 D9` |
+  | 0x07 | 剪线停止（回到剪刀张开的位置停住） | `AA 55 01 07 00 00 B0 19` |
+  | 0x08 | 果篮打开 | `AA 55 01 08 00 00 80 1A` |
+  | 0x09 | 果篮关闭 | `AA 55 01 09 00 00 D1 DA` |
 
 - 接线：C 板 3-pin 口（USART6，线序 GND / TXD / RXD；115200 8N1，.ioc 早就是这样配的，这次没改）↔ 节点 PA3（RX）/ PA2（TX），TX、RX 交叉，共地。3-pin 口没有 5V，节点要自己供电。节点现在不回帧，只接 C 板 TXD → 节点 PA3 和 GND 也能用。
 - 帧层：`UserModules/Devices/ArmNode/Binary_Protocol.c/h`，拷自 SC09ServoTest（和 Host_Computer_ReadyForApp、旧工程 Chassis_BareMetal 是同一套），只改了一处：`rx_calculated_crc` 的初值 0xFFFF → 0（`BinaryProtocol_Init` 会重新设成 0xFFFF，行为不变），不改的话它进 `.data`，会把本文件记的所有调试地址整体往后挤 4 字节。用法和旧工程一样：`Arm_Node_Init` 里 `BinaryProtocol_Init(&huart6)`（由 `BareMetal_Init` 调）（循环 DMA 接收 + 空闲中断），`main.c` 的两个 UART 回调按 Instance 转给它，主循环里 `BinaryProtocol_Task()`。
 - 遥控（主循环，`Arm_Remote.c` 算出 `Arm_NodeCommand_t`；只在主循环里用，不经过 TIM8，所以没放进 `arm_command`）：
-  - SC（CH7）三档：拨上 → `extend_dir` = +1，中位 → 0，拨下 → −1。和升降一样，使能后要先回过一次中位才生效（`ExtendArmed`）。
-  - 左摇杆上下（CH1）：读数 > +0.5 → 打开区，< −0.5 → 闭合区，中间那段保持原来的区（回差，杆停在门限附近不会来回发）。使能那一刻记下杆在哪个区，换到别的区以后才发（`GripperArmed`），和 SD 控 RS05 一样，一使能夹爪不会自己动。推上是打开还是闭合由 `Arm_Remote.h` 的 `ARM_GRIPPER_POSITIVE` / `ARM_GRIPPER_NEGATIVE` 决定，反了对调。
+  - 左摇杆上下（CH1，不回中）→ 步进 `extend_dir`：读数 > +0.5 → +1（前进），< −0.5 → −1（后退），绝对值 < 0.3 → 0（停），0.3 ~ 0.5 之间保持原来的区（回差：杆停在门限附近不会在走 / 停之间来回跳，每跳一次就要发一帧）。使能后杆要先回过一次中间才生效（`ExtendArmed`）：开机时油门杆一般在最下，一使能不会后退。门限是 `Arm_Remote.h` 的 `ARM_EXTEND_MOVE_THRESHOLD` / `ARM_EXTEND_STOP_THRESHOLD`。杆不回中，松手不会停，要推回中间。
+  - SD（CH8）→ 夹爪 `gripper`：拨上合、拨下开（2026-10-24 用户确认）。使能那一刻记下 SD 在哪边，拨到另一边以后才发（`GripperArmed`）：一使能不会自己夹，更不会自己剪。反了对调 `ARM_GRIPPER_POSITIVE` / `ARM_GRIPPER_NEGATIVE`。
+  - SA → 果篮 `basket`：使能 → 关，锁定 → 开，掉线 → 不发（保持原样，免得断链把果子倒出来）。要注意：SA 也是锁车开关，每次锁车（包括紧急锁车）果篮都会开；上电时 SA 在锁定位，遥控一连上果篮就会开。
 - 发送（主循环，`Arm_Node_Update`，在 `APP/Arm/Arm_Node.c`）：
-  - 只在指令和上次发的不一样时发，一次一帧，两帧之间至少隔 50 ms（`ARM_NODE_SEND_INTERVAL_MS`），步进优先。原因：节点每收到一条就在主循环里阻塞执行、等驱动器回包（舵机不回话时约 100 ms），收帧事件队列只有 4 格，节点文档也写了"不要无间隔重复发送"。
-  - 伸缩：+1 → 0x03 正转，−1 → 0x05 反转，0 → 0x04 停止（`Arm_Node.c` 的 `ARM_NODE_EXTEND_UP_COMMAND` / `ARM_NODE_EXTEND_DOWN_COMMAND`；正转是伸还是缩上板看，反了对调）。夹爪：打开 → 0x01，闭合 → 0x02。
-  - 锁定 / 掉线：伸缩清 0 → 发停止；夹爪不发（保持原样，免得掉线时松开）。另外使能 → 失能那一下，只要上次补发停止以后转过，就不管上次发的是什么再补一帧停止：节点不回 ACK，防之前那帧停止丢了。
-  - 开机不发任何帧：节点上电不会自己转，C 板开机就当成已经停着。
+  - 只在指令和上次发的不一样时发，一次一帧，两帧之间至少隔 50 ms（`ARM_NODE_SEND_INTERVAL_MS`）。按这个顺序挑：步进补发停止 → 剪线补发停止 → 步进 → 剪线停止 → 夹爪 → 剪线开始 → 果篮。原因：节点每收到一条就在主循环里执行，步进、夹爪要阻塞等驱动器回包（舵机不回话时约 100 ms），收帧事件队列只有 4 格。
+  - 步进：+1 → 0x03 正转，−1 → 0x05 反转，0 → 0x04 停止（`ARM_NODE_EXTEND_UP_COMMAND` / `ARM_NODE_EXTEND_DOWN_COMMAND`；正转是伸还是缩上板看，反了对调）。
+  - 夹爪 + 剪线：SD 拨上 → 0x02 闭合，发出去 700 ms 后（`ARM_NODE_CUT_DELAY_MS`：节点里夹爪舵机运动时间 500 ms + 余量）→ 0x06 剪线开始；SD 拨下 → 先 0x07 剪线停止，50 ms 后 0x01 打开（先收剪刀再松夹爪）。合上不到 700 ms 就拨开：不剪。
+  - 果篮：0x08 打开 / 0x09 关闭。
+  - 锁定 / 掉线：步进清 0 → 发停止，剪线发停止，夹爪不发（保持原样，免得掉线时松开），锁定时再发果篮打开。另外使能 → 失能那一下，只要上次补发以后转过 / 剪过，就不管上次发的是什么再补一帧停止：节点不回 ACK，防之前那帧停止丢了。重新使能以后 SD 要拨一下才会再夹 / 剪。
+  - 开机不发帧；遥控连上后先按 SA 发一帧果篮开 / 关。节点上电步进不转，两个 PWM 舵机都不出脉冲（等第一条命令）。
   - 阻塞发送：8 字节在 115200 下约 0.7 ms，只在主循环里调，TIM8 里不碰串口。发送失败（`arm_node_tx_status` 不是 0）下个间隔重发。
+- 节点那边 2026-10-24 改的（细节见节点 README）：
+  - 剪线（LD-2015）原来上电 1 s 后就一直自己往复、不受 C 板控制，现在改成命令控制：上电不出脉冲，0x06 开始往复（第一下走离张开位远的那一端，先合剪刀），0x07 回到张开位停住。张开位 `LD2015_CUT_OPEN_US` 现在是占位值 1500，量好以后改节点的 `node_config.h`；往复两端 500 / 2500、每端停 2 s 沿用原来的。
+  - 果篮：PA11 / TIM1_CH4，开 / 关脉宽 `BASKET_OPEN_US` / `BASKET_CLOSE_US` = 1000 / 2500（2026-10-25 用户上板纠正：开 1000、关 2500）。舵机单独供电、和节点共地。
+  - 节点 .ioc：TIM1 原来那几行是手加的、不全（缺 `SH.S_TIM1_CH1` 和内部时钟源），按它重新生成会把 TIM1 整个删掉；这次补全并加了 CH4，用 CubeMX 6.15 重新生成，顺带删掉了 `stm32f1xx_it.c` USER CODE 里手写、现在会重复定义的 DMA1_Channel6 / USART2 中断函数。
 - 要注意（都是节点那边的，C 板这边管不了）：
   - 节点的停止：原来只发 `PD42S1_Stop()`（0xFC 立即停止 / 刹车），PD42S1 手册 4.4.13 写着刹停后要及时清除电机状态，否则电机会严重发烫。2026-10-23 已在节点里补上：0xFC 回包通过后再发 `PD42S1_ClearState()`（0xFB）。手册没写清完状态以后电机是什么样（停着，还是接着按之前的速度转），上板要确认：停下后不会自己再转、放一会儿不烫。
-  - 节点没有掉线超时：C 板死机、被调试器暂停、复位，或者 USART6 线断了，步进会一直按最后一条命令转。C 板复位以后也不会自动补停止（开机当成已经停着），这时要把 SC 拨到别的档再回中才会发停止。
+  - 节点没有掉线超时：C 板死机、被调试器暂停、复位，或者 USART6 线断了，步进和剪线都会一直按最后一条命令动。C 板复位以后也不会自动补停止（开机当成已经停着），这时要把左摇杆推出去再回中、SD 拨一下，才会重新发。
   - 节点不回 ACK：`arm_node_tx_status` = 0 只说明 C 板发出去了，节点收没收到、电机动没动，要看节点的 `g_node_app`。
 
 ### 上板测试（节点）
 
-1. 先单独确认节点：用串口助手按上面的表发 HEX，夹爪、步进都能动；发停止以后步进停住、不会自己再转，放一会儿摸电机不烫，节点的 `g_node_app.last_command_result` = 1（0xFC、0xFB 都回包了；是 4 就是有一条没回）。
-2. 断电接线：C 板 3-pin 口 TXD → 节点 PA3、RXD ← 节点 PA2、GND 共地。烧录这一版。
-3. 遥控开、SA 锁定、SC 中位，上电：`arm_node_send_count` = 0，不发任何帧。
-4. 确认左摇杆上下是 CH1：暂停看 `'elrs_crsf.c'::elrs_channels[0]`，推左摇杆上下，应该在 172 ~ 1811 之间变，`[1]`~`[3]` 不跟着变。不是的话告诉我改 `ARM_GRIPPER_CHANNEL`。
-5. SA 拨使能：不发帧。SC 拨上 → `arm_node_last_command` = 3（正转），步进转；回中 → 4（停）；拨下 → 5（反转）。记下正转是伸还是缩，反了对调那两个宏。
-6. 左摇杆推上 → 1（打开），拉下 → 2（闭合）。刚使能时不动，杆要先换一次区。
-7. 回中保护：SC 拨上的状态下 SA 锁定 → 发停止（4）；再使能 → 不动，SC 回中再拨上才转。关遥控同理（约 500 ms 后发停止）。
+1. 先单独确认节点：用串口助手按上面的表发 HEX：0x01 / 0x02 夹爪动；0x03 / 0x05 步进转、0x04 停住不再转、放一会儿摸电机不烫；0x06 剪线开始往复、0x07 回到一个位置停住；0x08 / 0x09 果篮开（1000）/ 关（2500）。节点的 `g_node_app.last_command_result` = 1（是 4 就是有一条没回包或 PWM 没起来）。节点上电时剪线、果篮都不应该动。
+2. 断电接线：C 板 3-pin 口 TXD → 节点 PA3、RXD ← 节点 PA2、GND 共地；剪线舵机信号接 PA8、果篮舵机信号接 PA11，舵机电源单独供、和节点共地。C 板和节点都烧这一版。
+3. 遥控开、SA 锁定、左摇杆在最下、SD 拨下（开），上电：只发一帧果篮打开（`arm_node_last_command` = 8，`arm_node_send_count` = 1）。
+4. SA 拨使能：只发果篮关闭（9）。左摇杆在最下时步进不动，推回中间也不发。
+5. 左摇杆推上 → 3（正转 / 前进）；回中 → 4；拉下 → 5；回中 → 4。记下正转是伸还是缩，反了对调那两个宏。杆停在 0.3 ~ 0.5 之间不会变。
+6. SD 拨上 → 2（闭合），约 0.7 s 后 → 6（剪线开始），剪线舵机一直往复；SD 拨下 → 7（剪线停止，回张开位）→ 1（打开）。
+7. 剪线中 SA 锁定 → 发 4（步进转过的话）、7、8，夹爪保持合着；再使能 → 只发 9，不剪；SD 拨下再拨上才重新夹 / 剪。关遥控同理（约 500 ms 后发 7，果篮不动）。
 8. 排查：`arm_node_send_count` 在涨但节点没反应 → 看节点的 `g_node_app.host_frame_count` 涨不涨，不涨查 TX / RX 是否交叉、是否共地；`arm_node_tx_status` 不是 0 → C 板这边串口没发出去。
 
 ### 调试变量地址（节点）
 
-按 2026-10-23 拆分以后的 Debug 构建（这一组地址整体变了）。
+按 2026-10-25 的 Debug 构建（2026-10-24 改版时 `arm_node_*` 没变、`Arm_Remote.c` 的 static 挪了；2026-10-25 底盘加了加速度限制以后，这一节全部往后挪了 20 字节）。
 
-- `arm_node_last_command`（1 字节，最近一次发出去的命令 1~5）：`0x20000938`
-- `arm_node_send_count`（`uint32_t`，一共发出去几帧）：`0x2000093C`
-- `arm_node_tx_status`（1 字节，最近一次发送的结果，0 = HAL_OK）：`0x20000940`
-- `arm_node_rx_count`（`uint32_t`，节点发回来的合法帧数，现在应该一直是 0）：`0x20000944`
-- `NodeCommand`（`Arm_Remote.c` 里的 static：`extend_dir` 在 +0（`int8_t`），`gripper` 在 +1（0 不发 / 1 打开 / 2 闭合））：`0x20000970`，Watches 里写 `'Arm_Remote.c'::NodeCommand`
-- `ExtendArmed`（1 = SC 已经回过中位）：`0x20000972`；`GripperZone`（0 还没出过中间段 / 1 打开区 / 2 闭合区）：`0x20000973`；`GripperArmed`（1 = 使能后左摇杆换过区）：`0x20000976`
+- `arm_node_last_command`（1 字节，最近一次发出去的命令 1~9）：`0x2000094C`
+- `arm_node_send_count`（`uint32_t`，一共发出去几帧）：`0x20000950`
+- `arm_node_tx_status`（1 字节，最近一次发送的结果，0 = HAL_OK）：`0x20000954`
+- `arm_node_rx_count`（`uint32_t`，节点发回来的合法帧数，现在应该一直是 0）：`0x20000958`
+- `NodeCommand`（`Arm_Remote.c` 里的 static：`extend_dir` 在 +0（`int8_t`），`gripper` 在 +1（0 不发 / 1 打开 / 2 闭合），`basket` 在 +2（0 不发 / 1 打开 / 2 关闭））：`0x20000990`，Watches 里写 `'Arm_Remote.c'::NodeCommand`
+- `ExtendArmed`（1 = 左摇杆已经回过中间）：`0x20000993`；`ExtendZone`（`int8_t`，左摇杆现在在哪个区 +1 / 0 / −1）：`0x20000994`；`GripperZone`（0 还没读到 / 1 开 / 2 合）：`0x20000995`；`GripperArmed`（1 = 使能后 SD 拨过）：`0x20000998`
+- 剪线 / 果篮上次发的（`Arm_Node.c` 里的 static）：`arm_node_cut_sent`（1 = 在剪）`0x20000968`、`arm_node_basket_sent`（1 开 / 2 关）`0x20000970`，Watches 里写 `'Arm_Node.c'::arm_node_cut_sent`
 
 ## 构建
 
@@ -293,3 +312,20 @@ cmake --build --preset Debug
 - 行为：节点发帧、RS05 遥控控制、升降遥控三套主机模拟在拆分前后各跑一遍，全部 PASS，打印的输出逐行一致（RS05 收到停止 8 / 使能 4 / 写参数 1184 / 读 393 / 保存 1，节点 32 次发送，CAN1 21520 帧 / CAN2 21736 帧）；在新文件上做的三个反向检查（去掉节点补发停止、去掉 RS05 使能后先停在原地、升降不判使能）都在对应那一步被抓到；OMNI / MECANUM 通过。
 - 地址：底盘四台电机（`chassis_motors`、`chassis_motor_manager`）和驱动层变量没变；`chassis_command`、升降、RS05、节点、`Arm_Remote.c` 的变量都挪了，上面的地址表已按新 ELF 用 gdb 重算。
 未烧录。修改前的文件备份在 `C:\Project\Fruit-picking robot\backups\split-baremetal-20261023-161301`（带 SHA-256）。模拟源码在 `%TEMP%\fp_node_sim`（`build.sh` 已加上四个新文件；`build_presplit.sh` 是拆分前的）。
+
+2026-10-24 遥控映射改版（机械那边的要求）：SA = 使能 + 果篮（锁定开 / 使能关 / 掉线不动），SB 升降不变，SC = RS05 点动（拨上往正前方 / 中位停 / 拨下往果框上方），SD = 夹爪（拨上合、合上 700 ms 后剪线一直往复 / 拨下先停剪线再开），左摇杆上下（CH1）= 步进（推上前进 / 中间停 / 拉下后退，带回差、使能后回过中间才生效）。C 板改了 `Arm_Remote.c/h`（新映射、步进三区回差、果篮跟 SA，`rotate_basket` → `rotate_dir`）、`Arm_Rotate.c/h`（CSP 点动：两端就是软限位，回中停在当时的位置，停住的位置优先用类型 2 应答、对不上退回 mechPos；"使能后先停在原地"改成"这次使能后 SC 回过中位才动"，仍放在 Arm_Rotate 里）、`Arm_Node.c/h`（剪线开始 / 停止、果篮开 / 关、发送顺序、失能补发剪线停止）、`ArmNode_Command.h`（加 0x06~0x09）、`BareMetal.c/h`（一行参数和注释）。RS05 没改成速度模式：使能流程差不多长、位置保护一个都省不掉，C 板死机 / 调试器暂停时速度模式会一直转，CSP 最多走到行程一端。节点（`C:\Clion\SC09ServoTest`）：LD-2015 剪线从"上电自己往复"改成命令控制（`ld2015_auto.c/h` → `ld2015_cut.c/h`），新增果篮 `basket.c/h`（PA11 / TIM1_CH4），`node_app` 加四条命令；.ioc 里 TIM1 原来不全（按它生成会删掉 TIM1），补全 CH1、加 CH4 后用 CubeMX 6.15 重新生成，删掉 `stm32f1xx_it.c` USER CODE 里会重复定义的两个手写中断函数。剪刀张开位、果篮开 / 关脉宽都是占位值，等用户给。
+- 构建（临时目录全量）：C 板 Debug 0 警告（FLASH 44344 B，RAM 4616 B），Release 0 警告（FLASH 25524 B）；节点 Debug 0 警告（FLASH 22972 B，RAM 3288 B），Release 0 警告（FLASH 12308 B）。
+- 节点主机测试（GCC 13.1，`-Werror`）三组都过：九条帧的字节、剪线往复 / 回张开位 / 上电不出脉冲、果篮只动 CH4、PWM 起不来报驱动错误。
+- C 板主机模拟：新写的节点模拟 14 个场景（果篮跟 SA、步进回差和回中、合上 700 ms 后剪、拨开先停剪线、锁定 / 掉线补发停止、重新使能不自己剪、发送失败重发等）、RS05 点动模拟（回中后往回退 0.015 rad；类型 2 故意偏 1 rad 时退回 mechPos、往回退 0.06 rad；受控运行全程在 −2.460 ~ 2.426 之间；使能 / RS05 重启时 SC 拨在一边不动）、升降模拟（结果和以前一样）、OMNI / MECANUM 都 PASS。反向检查 13 个（C 板 10 个：去回差、去回中、锁定不开果篮、去 700 ms、先开夹爪后停剪线、去补发剪线停止、RS05 去回中保护、不比对类型 2、只用 mechPos、回中不更新停住的位置；节点 3 个：上电就往复、停止不回张开位、果篮写错通道）全部被抓到。
+- 地址：底盘四台电机、升降、RS05、`arm_node_*` 没变；`chassis_command` → 0x20000960，`arm_command` → 0x20000974（`rotate_dir` 在 +1），`Arm_Remote.c` 的 static 挪了，上面已按新 ELF 用 gdb 重算。
+未烧录。修改前的文件备份在 `C:\Project\Fruit-picking robot\backups\remap-20261024-224528`（含 SC09ServoTest 的副本）。模拟源码在 `%TEMP%\fp_remap_sim`（`build.sh` 要把 CLion 的 `mingw/bin` 放在 PATH 最前面）。
+
+2026-10-25 上板以后：用户说其余功能都正常，三处要改。① 底盘上坡上不去：固定档位低档 0.35 → 中档 0.65；电流指令限幅 3000 → 8000（≈ 9.8 A，接近 M3508 额定 10 A / 3 N·m，手册核过）；速度环积分项上限底盘单独 1000 → 6000（`motor_control.c/h` 新加 `MotorControl_SetSpeedIntegralLimit`，只新增函数，升降仍是默认 1000）；`Chassis_Control.c` 加了指令加速度限制（每拍 0.002，三个量同比例缩，0 → 中档推满约 0.33 s，失能时清零）。② 果篮脉宽：开 2500、关 1000（节点 `node_config.h`）。③ RS05 往果框那头差几十度：没改，等用户量（往果框那头再加超过约 0.5 rad 就会碰到 zero_sta = 1 的 +π 跳变点，要先量出实际要到的读数再定怎么改）。
+- 构建：C 板 Debug 0 警告（FLASH 44768 B，RAM 4640 B），Release 0 警告（FLASH 25724 B）；节点 Debug / Release 0 警告（大小没变）。
+- 验证：节点三组主机测试 PASS；升降模拟里的底盘段改成：限幅 8000 / 积分上限 6000 / 升降积分上限仍 1000、中档推满 ±1097 rpm、目标每拍涨 3~4 rpm 第 323 ms 到 1090 以上、轮子卡住（反馈 0）时电流顶到 ±8000、松杆一拍一拍降到 0、锁车失能后再使能从 0 加速，PASS；节点、RS05 两套模拟和 OMNI / MECANUM PASS；反向检查 2 个（去掉加速度限制、失能不清零）都被抓到。
+- 地址：底盘四台电机没变，其余全部往后挪了 20 字节（上面四张表已按新 ELF 用 gdb 重算）。
+未烧录。修改前的文件备份在 `C:\Project\Fruit-picking robot\backups\chassis-basket-20261025-012813`。
+
+2026-10-25（之后）：用户说 RS05 往果框那头差的不止十几度，问能不能再大，随后自己说不用了、把果篮往左挪一点，所以 RS05 没改。升降按用户要求把限流从 6000 调到 8000（约 9.8 A，`Arm_Lift.c`），其余没动（积分上限仍是 1000）。C 板 Debug / Release 0 警告，大小和上一版一样，调试地址没变；升降模拟加了"顶住时输出到 ±8000"的断言，三套模拟 PASS。未烧录。备份在 `C:\Project\Fruit-picking robot\backups\lift-current-20261025-015354`。
+
+2026-10-25（节点）：果篮脉宽按用户纠正是开 1000 / 关 2500（上面一条记录里的"开 2500、关 1000"是我理解反了）；夹爪闭合 360 → 380。节点后来加的"首次夹爪动作前同步舵机上限"把动作挡在了回包后面，实物上 SC09 完全不动；已改成同步只试一次、不挡动作、每次先开扭矩再移动（细节和上板怎么看 `g_node_app` 见节点 README 最后一条）。C 板这边只改了 `ArmNode_Command.h` 的注释（360 → 380），帧没变。

@@ -17,7 +17,7 @@ extern "C" {
 #define CHASSIS_SWITCH_THRESHOLD  0.50f
 #define CHASSIS_COMMAND_MIN      (-1.00f)
 #define CHASSIS_COMMAND_MAX       1.00f
-/* 底盘现在固定低档；高 / 中档没有开关切了，暂时不用。 */
+/* 底盘现在固定中档（2026-10-25 起，之前是低档）；没有开关切档，高 / 低档暂时不用。 */
 #define CHASSIS_HIGH_LIMIT        1.00f
 #define CHASSIS_MEDIUM_LIMIT      0.65f
 #define CHASSIS_LOW_LIMIT         0.35f

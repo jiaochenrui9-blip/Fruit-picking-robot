@@ -97,6 +97,16 @@ void MotorControl_SetTargetSpeed(DJI_Motor_t *motor, int16_t target_speed)
     motor->speed.target_rpm = target_speed;
 }
 
+void MotorControl_SetSpeedIntegralLimit(DJI_Motor_t *motor, float limit)
+{
+    if ((motor == NULL) || (limit < 0.0f))
+    {
+        return;
+    }
+    motor->speed.pid.integralMax = limit;
+    motor->speed.pid.integralMin = -limit;
+}
+
 void MotorControl_SetMode(DJI_Motor_t *motor, MotorControlMode_e mode)
 {
     if (motor == NULL )

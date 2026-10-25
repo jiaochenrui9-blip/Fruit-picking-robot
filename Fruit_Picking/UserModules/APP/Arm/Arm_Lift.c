@@ -5,7 +5,9 @@
 #include "motor_control.h"
 
 /* 升降 3508（CAN2，C620 ID1）：SB 拨上 / 中 / 下 = +LIFT_SPEED_RPM / 0 / -LIFT_SPEED_RPM。 */
-#define LIFT_CURRENT_LIMIT      6000.0f   /* 电流指令限幅（协议数值，约 7.3 A），上板试调值 */
+/* 电流指令限幅（协议数值，±16384 ↔ ±20 A）：8000 ≈ 9.8 A，接近 M3508 额定电流 10 A。
+   2026-10-25 用户要求调大（之前是上板试调的 6000，约 7.3 A）。还没有软限位，拨着 SB 顶到头会一直出满这么多。 */
+#define LIFT_CURRENT_LIMIT      8000.0f
 #define LIFT_SPEED_KP             15.0f   /* 速度环，上板试调值 */
 #define LIFT_SPEED_KI             30.0f
 #define LIFT_SPEED_KD              0.0f

@@ -18,18 +18,20 @@ extern "C" {
  *
  *   main() while(1) ────────  BareMetal_MainLoop()
  *        ├─ ELRS_DMA_Process：解析 CRSF（中断里只记 DMA 写到哪）
- *        ├─ Chassis_Remote_Update：在线 + SA（CH5）→ state，摇杆 → vx / vy / wz（固定低档）
- *        ├─ Arm_Remote_Update：SB（CH6）→ 升降方向（使能后回过一次中位才生效），SD（CH8）→ 旋转到正前方 / 果框；
- *        │    SC（CH7）→ 伸缩方向（同样回过中位才生效），左摇杆上下（CH1）→ 夹爪开 / 合（使能后杆换过一次区才算）
+ *        ├─ Chassis_Remote_Update：在线 + SA（CH5）→ state，摇杆 → vx / vy / wz（固定中档）
+ *        ├─ Arm_Remote_Update：SB（CH6）→ 升降方向（使能后回过一次中位才生效），SC（CH7）→ 旋转方向（往两端走 / 停）；
+ *        │    左摇杆上下（CH1）→ 步进方向（带回差，同样回过中间才生效），SD（CH8）→ 夹爪合 / 开（使能后拨过一次才算），
+ *        │    SA（整车状态）→ 果篮关 / 开
  *        │    → 关中断，chassis_command、arm_command 一起整条拷贝（发布）
- *        └─ Arm_Node_Update：伸缩 / 夹爪指令变了就经 USART6 给机械臂 STM32 节点发命令帧（阻塞发送，
- *             两帧至少隔 50 ms）；伸缩、夹爪不经过 TIM8
+ *        └─ Arm_Node_Update：步进 / 夹爪 / 剪线 / 果篮指令变了就经 USART6 给机械臂 STM32 节点发命令帧（阻塞发送，
+ *             两帧至少隔 50 ms；夹爪合上 700 ms 后才发剪线开始）；这些都不经过 TIM8
  *
  *   TIM8 (1kHz, 优先级 5)  ── BareMetal_ControlTick()：先判一次遥控在线 + SA 使能，再按顺序调
  *        ├─ Chassis_Control_Update：使能 → 全向轮解算 → 速度环；否则失能 → CAN1 电流帧
  *        ├─ Arm_Lift_Update：使能 → 速度环，目标 = 升降方向 × LIFT_SPEED_RPM；否则失能 → CAN2 电流帧
  *        └─ Arm_Rotate_Update：遥控在线 + SA、RS05 在线、zero_sta 已是 1、位置在行程内 → CSP 使能，
- *           目标按 SD（使能后先停在原地，拨一下 SD 才动）；否则停止。另外每 100 ms 读 mechPos → CAN2 扩展帧
+ *           目标按 SC 点动（往一端走就给那一端，回中停在当时的位置；使能后先停在原地，SC 回过中位才动）；
+ *           否则停止。另外每 100 ms 读 mechPos → CAN2 扩展帧
  *
  * CAN2 的帧都从 TIM8 里发（初始化时除外），主循环不发：两边同时调 HAL_CAN_AddTxMessage 会抢同一个邮箱。
  *

@@ -3,12 +3,13 @@
 #include "elrs_crsf.h"
 #include <stddef.h>
 
-/* SB 改给升降以后（2026-10-22），底盘固定低档，gear / speed_limit 不再变。 */
+/* SB 改给升降以后（2026-10-22）没有档位开关了，底盘固定一个档，gear / speed_limit 不再变：
+   2026-10-25 起固定中档（0.65，之前是低档 0.35）。 */
 static Chassis_Command_t ChassisCommand =
 {
     .state = CHASSIS_STATE_OFFLINE,
-    .gear = CHASSIS_GEAR_LOW,
-    .speed_limit = CHASSIS_LOW_LIMIT,
+    .gear = CHASSIS_GEAR_MEDIUM,
+    .speed_limit = CHASSIS_MEDIUM_LIMIT,
     .vx = 0.0f,
     .vy = 0.0f,
     .wz = 0.0f
@@ -91,7 +92,7 @@ void Chassis_Remote_Update(void)
     ChassisCommand.wz = Chassis_Remote_ApplyDeadzone(
         ELRS_CRSF_RawToNormalized(Channels[CHASSIS_WZ_CHANNEL - 1u]));
 
-    /* 档位只改变最大幅值（现在固定低档），最终结果始终限制在 -1.0 ~ 1.0。 */
+    /* 档位只改变最大幅值（现在固定中档），最终结果始终限制在 -1.0 ~ 1.0。 */
     ChassisCommand.vx = Chassis_Remote_Clamp(
         ChassisCommand.vx * ChassisCommand.speed_limit,
         CHASSIS_COMMAND_MIN, CHASSIS_COMMAND_MAX);

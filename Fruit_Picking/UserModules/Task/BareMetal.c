@@ -72,7 +72,7 @@ HAL_StatusTypeDef BareMetal_Init(void)
     }
 
     /* 机械臂节点：USART6 循环 DMA 接收 + 空闲中断（启动失败时协议层在主循环里重试）；发送在主循环。
-       开机不给节点发任何命令，第一帧要等遥控使能后拨了 SC 或左摇杆。 */
+       开机不给节点发命令：遥控连上以后先按 SA 发果篮开 / 关，其余要等使能后拨了左摇杆或 SD。 */
     Arm_Node_Init();
 
     /* 全部就绪后才放开 1kHz 控制节拍。 */
@@ -81,7 +81,7 @@ HAL_StatusTypeDef BareMetal_Init(void)
 }
 
 /* TIM8 1kHz 中断里只做电机控制：底盘（解算 → 速度环 → CAN1），升降（速度环 → CAN2），
-   旋转（判能不能使能 → CSP 目标 → CAN2）。
+   旋转（判能不能使能 → CSP 点动目标 → CAN2）。
    遥控在线 + 使能这里判一次，三个机构用同一个结果：TIM8 执行期间 uwTick 不会变（SysTick 优先级更低，打断不了它），
    发布的指令也不会变（主循环跑不了），和以前每个机构各判一次结果一样。 */
 void BareMetal_ControlTick(void)
@@ -90,7 +90,7 @@ void BareMetal_ControlTick(void)
 
     Chassis_Control_Update(&chassis_command, enabled);
     Arm_Lift_Update(arm_command.lift_dir, enabled);
-    Arm_Rotate_Update(arm_command.rotate_basket, enabled);
+    Arm_Rotate_Update(arm_command.rotate_dir, enabled);
 }
 
 /* 主循环：ELRS 解析和遥控逻辑、给机械臂节点发命令，不参与 1kHz 控制，随便被中断打断。 */
